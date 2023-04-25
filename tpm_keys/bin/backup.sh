@@ -35,7 +35,7 @@ cp my_drsk.pub dup.pub
 tpm2_startauthsession --policy-session -S session.dat 
 tpm2_policycommandcode -S session.dat -L policy.dat TPM2_CC_Duplicate 
 tpm2_loadexternal -C o -u server.pub -c server.ctx
-tpm2_duplicate -C server.ctx -c my_drsk.ctx -G null -p "session:session.dat" -r dup.dpriv -s dup.seed 
+tpm2_duplicate -C server.ctx -c 0x81000004 -G null -p "session:session.dat" -r dup.dpriv -s dup.seed 
 tpm2_flushcontext session.dat 
 
 # send dup.pub, dup.dpriv, dup.seed to server

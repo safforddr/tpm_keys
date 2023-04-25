@@ -16,6 +16,7 @@ if [ -z "$1" ]
 fi
 cd $BASEDIR/clients/$1
 
+tpm2_load -C 0x81000004 -u dup.pub -r dup.prv -c dup.ctx
 tpm2_startauthsession --policy-session -S session.dat 
 tpm2_policycommandcode -S session.dat -L policy.dat TPM2_CC_Duplicate 
 # load client's SRK2 public key
