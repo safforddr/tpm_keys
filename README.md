@@ -16,3 +16,9 @@ sudo chown -R $USERNAME:tss /boot/tpm_keys
 cd /boot/tpm_keys/bin
 
 ./provision.sh
+
+NOTE: provision.sh will set an owner password, which causes problems
+with systemd-cryptenroll. Apply the supplied srk_handle.patch to
+the upstream systemd to add a --tpm2-srk-handle= argument. Then
+after provisioning, you can set --tpm2-srk-handle=0x81000004 to
+use the recoverable DRSK as storage root.
