@@ -1,0 +1,840 @@
+This patch allows the previously hardcoded tpm2 srk handle to be set from
+a --tpm2-srk-handle= argument. This supports use cases where the 
+tpm2 owner auth is set, and a key other than the default 0x81000001 needs
+to be used, such as when a recoverable storage hierarchy is desired.
+The argument defaults to 0x81000001, which is the current behavior.
+
+It also adds logic to read the object attributes from the selected
+storage key, and uses these attributes for the sealed object, so that
+sealing will work with a recoverable key.
+
+diff --git a/src/core/execute.c b/src/core/execute.c
+index 8ddd7362a3..bf2c72881e 100644
+--- a/src/core/execute.c
++++ b/src/core/execute.c
+@@ -2918,7 +2918,7 @@ static int load_credential(
+                 _cleanup_free_ void *plaintext = NULL;
+                 size_t plaintext_size = 0;
+ 
+-                r = decrypt_credential_and_warn(id, now(CLOCK_REALTIME), NULL, NULL, data, size, &plaintext, &plaintext_size);
++                r = decrypt_credential_and_warn(id, now(CLOCK_REALTIME), NULL, NULL, 0, data, size, &plaintext, &plaintext_size);
+                 if (r < 0)
+                         return r;
+ 
+@@ -3092,7 +3092,7 @@ static int acquire_credentials(
+                         return log_debug_errno(errno, "Failed to test if credential %s exists: %m", sc->id);
+ 
+                 if (sc->encrypted) {
+-                        r = decrypt_credential_and_warn(sc->id, now(CLOCK_REALTIME), NULL, NULL, sc->data, sc->size, &plaintext, &size);
++                        r = decrypt_credential_and_warn(sc->id, now(CLOCK_REALTIME), NULL, NULL, 0, sc->data, sc->size, &plaintext, &size);
+                         if (r < 0)
+                                 return r;
+ 
+diff --git a/src/creds/creds.c b/src/creds/creds.c
+index 670e719d21..3951c0e1af 100644
+--- a/src/creds/creds.c
++++ b/src/creds/creds.c
+@@ -48,6 +48,7 @@ static uint32_t arg_tpm2_pcr_mask = UINT32_MAX;
+ static char *arg_tpm2_public_key = NULL;
+ static uint32_t arg_tpm2_public_key_pcr_mask = UINT32_MAX;
+ static char *arg_tpm2_signature = NULL;
++static uint32_t arg_tpm2_srk_handle = UINT32_MAX;
+ static const char *arg_name = NULL;
+ static bool arg_name_any = false;
+ static usec_t arg_timestamp = USEC_INFINITY;
+@@ -423,6 +424,7 @@ static int verb_cat(int argc, char **argv, void *userdata) {
+                                         timestamp,
+                                         arg_tpm2_device,
+                                         arg_tpm2_signature,
++                                        arg_tpm2_srk_handle,
+                                         data, size,
+                                         &plaintext, &plaintext_size);
+                         if (r < 0)
+@@ -497,6 +499,7 @@ static int verb_encrypt(int argc, char **argv, void *userdata) {
+                         arg_tpm2_pcr_mask,
+                         arg_tpm2_public_key,
+                         arg_tpm2_public_key_pcr_mask,
++                        arg_tpm2_srk_handle,
+                         plaintext, plaintext_size,
+                         &output, &output_size);
+         if (r < 0)
+@@ -586,6 +589,7 @@ static int verb_decrypt(int argc, char **argv, void *userdata) {
+                         timestamp,
+                         arg_tpm2_device,
+                         arg_tpm2_signature,
++                        arg_tpm2_srk_handle,
+                         input, input_size,
+                         &plaintext, &plaintext_size);
+         if (r < 0)
+@@ -727,6 +731,7 @@ static int parse_argv(int argc, char *argv[]) {
+                 ARG_TPM2_PUBLIC_KEY,
+                 ARG_TPM2_PUBLIC_KEY_PCRS,
+                 ARG_TPM2_SIGNATURE,
++                ARG_TPM2_SRK_HANDLE,
+                 ARG_NAME,
+                 ARG_TIMESTAMP,
+                 ARG_NOT_AFTER,
+@@ -748,6 +753,7 @@ static int parse_argv(int argc, char *argv[]) {
+                 { "tpm2-public-key",      required_argument, NULL, ARG_TPM2_PUBLIC_KEY      },
+                 { "tpm2-public-key-pcrs", required_argument, NULL, ARG_TPM2_PUBLIC_KEY_PCRS },
+                 { "tpm2-signature",       required_argument, NULL, ARG_TPM2_SIGNATURE       },
++                { "tpm2-srk-handle",      required_argument, NULL, ARG_TPM2_SRK_HANDLE      },
+                 { "name",                 required_argument, NULL, ARG_NAME                 },
+                 { "timestamp",            required_argument, NULL, ARG_TIMESTAMP            },
+                 { "not-after",            required_argument, NULL, ARG_NOT_AFTER            },
+@@ -884,7 +890,13 @@ static int parse_argv(int argc, char *argv[]) {
+                                 return r;
+ 
+                         break;
++                        
++                case ARG_TPM2_SRK_HANDLE:
++                        r = safe_atou_full(optarg, 16, &arg_tpm2_srk_handle);
++                        if (r < 0)
++                                return r;
+ 
++                        break;
+                 case ARG_NAME:
+                         if (isempty(optarg)) {
+                                 arg_name = NULL;
+@@ -929,6 +941,8 @@ static int parse_argv(int argc, char *argv[]) {
+                 arg_tpm2_pcr_mask = TPM2_PCR_MASK_DEFAULT;
+         if (arg_tpm2_public_key_pcr_mask == UINT32_MAX)
+                 arg_tpm2_public_key_pcr_mask = UINT32_C(1) << TPM_PCR_INDEX_KERNEL_IMAGE;
++        if (arg_tpm2_srk_handle == UINT32_MAX)
++                arg_tpm2_srk_handle = TPM2_SRK_HANDLE_DEFAULT;
+ 
+         return 1;
+ }
+diff --git a/src/cryptenroll/cryptenroll-tpm2.c b/src/cryptenroll/cryptenroll-tpm2.c
+index 4dc3c1794d..07c7e932a2 100644
+--- a/src/cryptenroll/cryptenroll-tpm2.c
++++ b/src/cryptenroll/cryptenroll-tpm2.c
+@@ -134,6 +134,7 @@ int enroll_tpm2(struct crypt_device *cd,
+                 size_t volume_key_size,
+                 const char *device,
+                 uint32_t hash_pcr_mask,
++                uint32_t srk_handle,
+                 const char *pubkey_path,
+                 uint32_t pubkey_pcr_mask,
+                 const char *signature_path,
+@@ -208,6 +209,7 @@ int enroll_tpm2(struct crypt_device *cd,
+ 
+         r = tpm2_seal(device,
+                       hash_pcr_mask,
++                      srk_handle,
+                       pubkey, pubkey_size,
+                       pubkey_pcr_mask,
+                       pin_str,
+@@ -240,6 +242,7 @@ int enroll_tpm2(struct crypt_device *cd,
+                 log_debug("Unsealing for verification...");
+                 r = tpm2_unseal(device,
+                                 hash_pcr_mask,
++                                srk_handle,
+                                 pcr_bank,
+                                 pubkey, pubkey_size,
+                                 pubkey_pcr_mask,
+@@ -288,6 +291,7 @@ int enroll_tpm2(struct crypt_device *cd,
+                         use_pin ? binary_salt : NULL,
+                         use_pin ? sizeof(binary_salt) : 0,
+                         srk_buf, srk_buf_size,
++                        srk_handle,
+                         flags,
+                         &v);
+         if (r < 0)
+diff --git a/src/cryptenroll/cryptenroll-tpm2.h b/src/cryptenroll/cryptenroll-tpm2.h
+index b6e0c2808e..c6e547b41b 100644
+--- a/src/cryptenroll/cryptenroll-tpm2.h
++++ b/src/cryptenroll/cryptenroll-tpm2.h
+@@ -7,9 +7,9 @@
+ #include "log.h"
+ 
+ #if HAVE_TPM2
+-int enroll_tpm2(struct crypt_device *cd, const void *volume_key, size_t volume_key_size, const char *device, uint32_t hash_pcr_mask, const char *pubkey_path, uint32_t pubkey_pcr_mask, const char *signature_path, bool use_pin);
++int enroll_tpm2(struct crypt_device *cd, const void *volume_key, size_t volume_key_size, const char *device, uint32_t hash_pcr_mask, uint32_t srk_handle, const char *pubkey_path, uint32_t pubkey_pcr_mask, const char *signature_path, bool use_pin);
+ #else
+-static inline int enroll_tpm2(struct crypt_device *cd, const void *volume_key, size_t volume_key_size, const char *device, uint32_t hash_pcr_mask, const char *pubkey_path, uint32_t pubkey_pcr_mask, const char *signature_path, bool use_pin) {
++static inline int enroll_tpm2(struct crypt_device *cd, const void *volume_key, size_t volume_key_size, const char *device, uint32_t hash_pcr_mask, uint32_t srk_handle, const char *pubkey_path, uint32_t pubkey_pcr_mask, const char *signature_path, bool use_pin) {
+         return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                "TPM2 key enrollment not supported.");
+ }
+diff --git a/src/cryptenroll/cryptenroll.c b/src/cryptenroll/cryptenroll.c
+index be57873ee4..09aa768693 100644
+--- a/src/cryptenroll/cryptenroll.c
++++ b/src/cryptenroll/cryptenroll.c
+@@ -38,6 +38,7 @@ static char *arg_pkcs11_token_uri = NULL;
+ static char *arg_fido2_device = NULL;
+ static char *arg_tpm2_device = NULL;
+ static uint32_t arg_tpm2_pcr_mask = UINT32_MAX;
++static uint32_t arg_tpm2_srk_handle = UINT32_MAX;
+ static bool arg_tpm2_pin = false;
+ static char *arg_tpm2_public_key = NULL;
+ static uint32_t arg_tpm2_public_key_pcr_mask = UINT32_MAX;
+@@ -126,6 +127,8 @@ static int help(void) {
+                "                       Enroll a TPM2 device\n"
+                "     --tpm2-pcrs=PCR1+PCR2+PCR3+…\n"
+                "                       Specify TPM2 PCRs to seal against\n"
++               "     --tpm2-srk-handle=HANDLE\n"
++               "                       Specify SRK handle to use - default 0x81000001\n"
+                "     --tpm2-public-key=PATH\n"
+                "                       Enroll signed TPM2 PCR policy against PEM public key\n"
+                "     --tpm2-public-key-pcrs=PCR1+PCR2+PCR3+…\n"
+@@ -158,6 +161,7 @@ static int parse_argv(int argc, char *argv[]) {
+                 ARG_FIDO2_DEVICE,
+                 ARG_TPM2_DEVICE,
+                 ARG_TPM2_PCRS,
++                ARG_TPM2_SRK_HANDLE,
+                 ARG_TPM2_PUBLIC_KEY,
+                 ARG_TPM2_PUBLIC_KEY_PCRS,
+                 ARG_TPM2_SIGNATURE,
+@@ -184,6 +188,7 @@ static int parse_argv(int argc, char *argv[]) {
+                 { "fido2-with-user-verification", required_argument, NULL, ARG_FIDO2_WITH_UV         },
+                 { "tpm2-device",                  required_argument, NULL, ARG_TPM2_DEVICE           },
+                 { "tpm2-pcrs",                    required_argument, NULL, ARG_TPM2_PCRS             },
++                { "tpm2-srk-handle",              required_argument, NULL, ARG_TPM2_SRK_HANDLE       },
+                 { "tpm2-public-key",              required_argument, NULL, ARG_TPM2_PUBLIC_KEY       },
+                 { "tpm2-public-key-pcrs",         required_argument, NULL, ARG_TPM2_PUBLIC_KEY_PCRS  },
+                 { "tpm2-signature",               required_argument, NULL, ARG_TPM2_SIGNATURE        },
+@@ -361,7 +366,14 @@ static int parse_argv(int argc, char *argv[]) {
+                                 return r;
+ 
+                         break;
++                        
++                case ARG_TPM2_SRK_HANDLE:
++                        r = safe_atou_full(optarg, 16, &arg_tpm2_srk_handle);
++                        if (r < 0)
++                                return r;
+ 
++                        break;
++                        
+                 case ARG_TPM2_PIN:
+                         r = parse_boolean_argument("--tpm2-with-pin=", optarg, &arg_tpm2_pin);
+                         if (r < 0)
+@@ -478,6 +490,8 @@ static int parse_argv(int argc, char *argv[]) {
+ 
+         if (arg_tpm2_pcr_mask == UINT32_MAX)
+                 arg_tpm2_pcr_mask = TPM2_PCR_MASK_DEFAULT;
++        if (arg_tpm2_srk_handle == UINT32_MAX)
++                arg_tpm2_srk_handle = TPM2_SRK_HANDLE_DEFAULT;
+         if (arg_tpm2_public_key_pcr_mask == UINT32_MAX)
+                 arg_tpm2_public_key_pcr_mask = UINT32_C(1) << TPM_PCR_INDEX_KERNEL_IMAGE;
+ 
+@@ -655,7 +669,7 @@ static int run(int argc, char *argv[]) {
+                 break;
+ 
+         case ENROLL_TPM2:
+-                slot = enroll_tpm2(cd, vk, vks, arg_tpm2_device, arg_tpm2_pcr_mask, arg_tpm2_public_key, arg_tpm2_public_key_pcr_mask, arg_tpm2_signature, arg_tpm2_pin);
++                slot = enroll_tpm2(cd, vk, vks, arg_tpm2_device, arg_tpm2_pcr_mask, arg_tpm2_srk_handle, arg_tpm2_public_key, arg_tpm2_public_key_pcr_mask, arg_tpm2_signature, arg_tpm2_pin);
+                 break;
+ 
+         case _ENROLL_TYPE_INVALID:
+diff --git a/src/cryptsetup/cryptsetup-tokens/cryptsetup-token-systemd-tpm2.c b/src/cryptsetup/cryptsetup-tokens/cryptsetup-token-systemd-tpm2.c
+index aab3a4b4c0..a26ae61d90 100644
+--- a/src/cryptsetup/cryptsetup-tokens/cryptsetup-token-systemd-tpm2.c
++++ b/src/cryptsetup/cryptsetup-tokens/cryptsetup-token-systemd-tpm2.c
+@@ -46,7 +46,7 @@ _public_ int cryptsetup_token_open_pin(
+         size_t blob_size, policy_hash_size, decrypted_key_size, pubkey_size, salt_size = 0, srk_buf_size = 0;
+         _cleanup_(erase_and_freep) void *decrypted_key = NULL;
+         _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+-        uint32_t hash_pcr_mask, pubkey_pcr_mask;
++        uint32_t hash_pcr_mask, pubkey_pcr_mask, srk_handle;
+         systemd_tpm2_plugin_params params = {
+                 .search_pcr_mask = UINT32_MAX
+         };
+@@ -94,6 +94,7 @@ _public_ int cryptsetup_token_open_pin(
+                         &salt_size,
+                         &srk_buf,
+                         &srk_buf_size,
++                        &srk_handle,
+                         &flags);
+         if (r < 0)
+                 return log_debug_open_error(cd, r);
+@@ -104,6 +105,7 @@ _public_ int cryptsetup_token_open_pin(
+         r = acquire_luks2_key(
+                         params.device,
+                         hash_pcr_mask,
++                        srk_handle,
+                         pcr_bank,
+                         pubkey, pubkey_size,
+                         pubkey_pcr_mask,
+@@ -179,7 +181,7 @@ _public_ void cryptsetup_token_dump(
+         _cleanup_free_ void *blob = NULL, *pubkey = NULL, *policy_hash = NULL, *salt = NULL, *srk_buf = NULL;
+         _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+         size_t blob_size, policy_hash_size, pubkey_size, salt_size = 0, srk_buf_size = 0;
+-        uint32_t hash_pcr_mask, pubkey_pcr_mask;
++        uint32_t hash_pcr_mask, pubkey_pcr_mask, srk_handle;
+         uint16_t pcr_bank, primary_alg;
+         TPM2Flags flags = 0;
+         int r;
+@@ -207,6 +209,7 @@ _public_ void cryptsetup_token_dump(
+                         &salt_size,
+                         &srk_buf,
+                         &srk_buf_size,
++                        &srk_handle,
+                         &flags);
+         if (r < 0)
+                 return (void) crypt_log_debug_errno(cd, r, "Failed to parse " TOKEN_NAME " JSON fields: %m");
+diff --git a/src/cryptsetup/cryptsetup-tokens/luks2-tpm2.c b/src/cryptsetup/cryptsetup-tokens/luks2-tpm2.c
+index e2fa49b94f..a91ed91f39 100644
+--- a/src/cryptsetup/cryptsetup-tokens/luks2-tpm2.c
++++ b/src/cryptsetup/cryptsetup-tokens/luks2-tpm2.c
+@@ -16,6 +16,7 @@
+ int acquire_luks2_key(
+                 const char *device,
+                 uint32_t hash_pcr_mask,
++                uint32_t srk_handle,
+                 uint16_t pcr_bank,
+                 const void *pubkey,
+                 size_t pubkey_size,
+@@ -83,6 +84,7 @@ int acquire_luks2_key(
+         return tpm2_unseal(
+                         device,
+                         hash_pcr_mask,
++                        srk_handle,
+                         pcr_bank,
+                         pubkey, pubkey_size,
+                         pubkey_pcr_mask,
+diff --git a/src/cryptsetup/cryptsetup-tokens/luks2-tpm2.h b/src/cryptsetup/cryptsetup-tokens/luks2-tpm2.h
+index 1143f5fd9f..03affd4c84 100644
+--- a/src/cryptsetup/cryptsetup-tokens/luks2-tpm2.h
++++ b/src/cryptsetup/cryptsetup-tokens/luks2-tpm2.h
+@@ -9,6 +9,7 @@ struct crypt_device;
+ int acquire_luks2_key(
+                 const char *device,
+                 uint32_t pcr_mask,
++                uint32_t srk_handle,
+                 uint16_t pcr_bank,
+                 const void *pubkey,
+                 size_t pubkey_size,
+diff --git a/src/cryptsetup/cryptsetup-tpm2.c b/src/cryptsetup/cryptsetup-tpm2.c
+index 5e277b0dd6..b7e05c4b71 100644
+--- a/src/cryptsetup/cryptsetup-tpm2.c
++++ b/src/cryptsetup/cryptsetup-tpm2.c
+@@ -57,6 +57,7 @@ int acquire_tpm2_key(
+                 const char *volume_name,
+                 const char *device,
+                 uint32_t hash_pcr_mask,
++                uint32_t srk_handle,
+                 uint16_t pcr_bank,
+                 const void *pubkey,
+                 size_t pubkey_size,
+@@ -133,6 +134,7 @@ int acquire_tpm2_key(
+                 return tpm2_unseal(
+                                 device,
+                                 hash_pcr_mask,
++                                srk_handle,
+                                 pcr_bank,
+                                 pubkey, pubkey_size,
+                                 pubkey_pcr_mask,
+@@ -175,6 +177,7 @@ int acquire_tpm2_key(
+ 
+                 r = tpm2_unseal(device,
+                                 hash_pcr_mask,
++                                srk_handle,
+                                 pcr_bank,
+                                 pubkey, pubkey_size,
+                                 pubkey_pcr_mask,
+@@ -205,6 +208,7 @@ int find_tpm2_auto_data(
+                 uint32_t search_pcr_mask,
+                 int start_token,
+                 uint32_t *ret_hash_pcr_mask,
++                uint32_t *ret_srk_handle,
+                 uint16_t *ret_pcr_bank,
+                 void **ret_pubkey,
+                 size_t *ret_pubkey_size,
+@@ -230,7 +234,7 @@ int find_tpm2_auto_data(
+                 _cleanup_free_ void *blob = NULL, *policy_hash = NULL, *pubkey = NULL, *salt = NULL, *srk_buf = NULL;
+                 _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+                 size_t blob_size, policy_hash_size, pubkey_size, salt_size = 0, srk_buf_size = 0;
+-                uint32_t hash_pcr_mask, pubkey_pcr_mask;
++                uint32_t hash_pcr_mask, pubkey_pcr_mask, srk_handle;
+                 uint16_t pcr_bank, primary_alg;
+                 TPM2Flags flags;
+                 int keyslot;
+@@ -253,6 +257,7 @@ int find_tpm2_auto_data(
+                                 &policy_hash, &policy_hash_size,
+                                 &salt, &salt_size,
+                                 &srk_buf, &srk_buf_size,
++                                &srk_handle,
+                                 &flags);
+                 if (r == -EUCLEAN) /* Gracefully handle issues in JSON fields not owned by us */
+                         continue;
+@@ -266,6 +271,7 @@ int find_tpm2_auto_data(
+                                 log_info("Automatically discovered security TPM2 token unlocks volume.");
+ 
+                         *ret_hash_pcr_mask = hash_pcr_mask;
++                        *ret_srk_handle = srk_handle;
+                         *ret_pcr_bank = pcr_bank;
+                         *ret_pubkey = TAKE_PTR(pubkey);
+                         *ret_pubkey_size = pubkey_size;
+diff --git a/src/cryptsetup/cryptsetup-tpm2.h b/src/cryptsetup/cryptsetup-tpm2.h
+index a510ac6257..284034ba3d 100644
+--- a/src/cryptsetup/cryptsetup-tpm2.h
++++ b/src/cryptsetup/cryptsetup-tpm2.h
+@@ -15,6 +15,7 @@ int acquire_tpm2_key(
+                 const char *volume_name,
+                 const char *device,
+                 uint32_t hash_pcr_mask,
++                uint32_t srk_handle,
+                 uint16_t pcr_bank,
+                 const void *pubkey,
+                 size_t pubkey_size,
+@@ -44,6 +45,7 @@ int find_tpm2_auto_data(
+                 uint32_t search_pcr_mask,
+                 int start_token,
+                 uint32_t *ret_hash_pcr_mask,
++                uint32_t *ret_srk_handle,
+                 uint16_t *ret_pcr_bank,
+                 void **ret_pubkey,
+                 size_t *ret_pubkey_size,
+@@ -67,6 +69,7 @@ static inline int acquire_tpm2_key(
+                 const char *volume_name,
+                 const char *device,
+                 uint32_t hash_pcr_mask,
++                uint32_t srk_handle,
+                 uint16_t pcr_bank,
+                 const void *pubkey,
+                 size_t pubkey_size,
+@@ -100,6 +103,7 @@ static inline int find_tpm2_auto_data(
+                 uint32_t search_pcr_mask,
+                 int start_token,
+                 uint32_t *ret_hash_pcr_mask,
++                uint32_t *ret_srk_handle,
+                 uint16_t *ret_pcr_bank,
+                 void **ret_pubkey,
+                 size_t *ret_pubkey_size,
+diff --git a/src/cryptsetup/cryptsetup.c b/src/cryptsetup/cryptsetup.c
+index 9105b662ce..2dc7147363 100644
+--- a/src/cryptsetup/cryptsetup.c
++++ b/src/cryptsetup/cryptsetup.c
+@@ -1636,6 +1636,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
+                                         name,
+                                         arg_tpm2_device,
+                                         arg_tpm2_pcr_mask == UINT32_MAX ? TPM2_PCR_MASK_DEFAULT : arg_tpm2_pcr_mask,
++                                        0,
+                                         UINT16_MAX,
+                                         /* pubkey= */ NULL, /* pubkey_size= */ 0,
+                                         /* pubkey_pcr_mask= */ 0,
+@@ -1693,7 +1694,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
+                         for (;;) {
+                                 _cleanup_free_ void *pubkey = NULL, *salt = NULL, *srk_buf = NULL;
+                                 size_t pubkey_size = 0, salt_size = 0, srk_buf_size = 0;
+-                                uint32_t hash_pcr_mask, pubkey_pcr_mask;
++                                uint32_t hash_pcr_mask, pubkey_pcr_mask, srk_handle;
+                                 uint16_t pcr_bank, primary_alg;
+                                 TPM2Flags tpm2_flags;
+ 
+@@ -1702,6 +1703,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
+                                                 arg_tpm2_pcr_mask, /* if != UINT32_MAX we'll only look for tokens with this PCR mask */
+                                                 token, /* search for the token with this index, or any later index than this */
+                                                 &hash_pcr_mask,
++                                                &srk_handle,
+                                                 &pcr_bank,
+                                                 &pubkey, &pubkey_size,
+                                                 &pubkey_pcr_mask,
+@@ -1731,6 +1733,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
+                                                 name,
+                                                 arg_tpm2_device,
+                                                 hash_pcr_mask,
++                                                srk_handle,
+                                                 pcr_bank,
+                                                 pubkey, pubkey_size,
+                                                 pubkey_pcr_mask,
+diff --git a/src/partition/repart.c b/src/partition/repart.c
+index d6db6ee73e..4357f20178 100644
+--- a/src/partition/repart.c
++++ b/src/partition/repart.c
+@@ -141,6 +141,7 @@ static char *arg_tpm2_device = NULL;
+ static uint32_t arg_tpm2_pcr_mask = UINT32_MAX;
+ static char *arg_tpm2_public_key = NULL;
+ static uint32_t arg_tpm2_public_key_pcr_mask = UINT32_MAX;
++static uint32_t arg_tpm2_srk_handle = UINT32_MAX;
+ static bool arg_split = false;
+ static sd_id128_t *arg_filter_partitions = NULL;
+ static size_t arg_n_filter_partitions = 0;
+@@ -3448,6 +3449,7 @@ static int partition_encrypt(Context *context, Partition *p, const char *node) {
+ 
+                 r = tpm2_seal(arg_tpm2_device,
+                               arg_tpm2_pcr_mask,
++                              arg_tpm2_srk_handle,
+                               pubkey, pubkey_size,
+                               arg_tpm2_public_key_pcr_mask,
+                               /* pin= */ NULL,
+@@ -3490,6 +3492,7 @@ static int partition_encrypt(Context *context, Partition *p, const char *node) {
+                                 hash, hash_size,
+                                 NULL, 0, /* no salt because tpm2_seal has no pin */
+                                 srk_buf, srk_buf_size,
++                                arg_tpm2_srk_handle,
+                                 0,
+                                 &v);
+                 if (r < 0)
+@@ -5818,6 +5821,7 @@ static int parse_argv(int argc, char *argv[]) {
+                 ARG_TPM2_PCRS,
+                 ARG_TPM2_PUBLIC_KEY,
+                 ARG_TPM2_PUBLIC_KEY_PCRS,
++                ARG_TPM2_SRK_HANDLE,
+                 ARG_SPLIT,
+                 ARG_INCLUDE_PARTITIONS,
+                 ARG_EXCLUDE_PARTITIONS,
+@@ -5851,6 +5855,7 @@ static int parse_argv(int argc, char *argv[]) {
+                 { "tpm2-pcrs",            required_argument, NULL, ARG_TPM2_PCRS            },
+                 { "tpm2-public-key",      required_argument, NULL, ARG_TPM2_PUBLIC_KEY      },
+                 { "tpm2-public-key-pcrs", required_argument, NULL, ARG_TPM2_PUBLIC_KEY_PCRS },
++                { "tpm2-srk-handle",      required_argument, NULL, ARG_TPM2_SRK_HANDLE      },
+                 { "split",                required_argument, NULL, ARG_SPLIT                },
+                 { "include-partitions",   required_argument, NULL, ARG_INCLUDE_PARTITIONS   },
+                 { "exclude-partitions",   required_argument, NULL, ARG_EXCLUDE_PARTITIONS   },
+@@ -6107,6 +6112,13 @@ static int parse_argv(int argc, char *argv[]) {
+                                 return r;
+ 
+                         break;
++                        
++                case ARG_TPM2_SRK_HANDLE:
++                        r = safe_atou_full(optarg, 16, &arg_tpm2_public_key_pcr_mask);
++                        if (r < 0)
++                                return r;
++
++                        break;
+ 
+                 case ARG_SPLIT:
+                         r = parse_boolean_argument("--split=", optarg, NULL);
+@@ -6215,6 +6227,8 @@ static int parse_argv(int argc, char *argv[]) {
+                 arg_tpm2_pcr_mask = TPM2_PCR_MASK_DEFAULT;
+         if (arg_tpm2_public_key_pcr_mask == UINT32_MAX)
+                 arg_tpm2_public_key_pcr_mask = UINT32_C(1) << TPM_PCR_INDEX_KERNEL_IMAGE;
++        if (arg_tpm2_srk_handle == UINT32_MAX)
++                arg_tpm2_srk_handle = TPM2_SRK_HANDLE_DEFAULT;
+ 
+         if (arg_pretty < 0 && isatty(STDOUT_FILENO))
+                 arg_pretty = true;
+diff --git a/src/shared/creds-util.c b/src/shared/creds-util.c
+index 59f580775d..7dbc0a460e 100644
+--- a/src/shared/creds-util.c
++++ b/src/shared/creds-util.c
+@@ -591,6 +591,7 @@ int encrypt_credential_and_warn(
+                 uint32_t tpm2_hash_pcr_mask,
+                 const char *tpm2_pubkey_path,
+                 uint32_t tpm2_pubkey_pcr_mask,
++                uint32_t srk_handle,
+                 const void *input,
+                 size_t input_size,
+                 void **ret,
+@@ -700,6 +701,7 @@ int encrypt_credential_and_warn(
+ 
+                 r = tpm2_seal(tpm2_device,
+                               tpm2_hash_pcr_mask,
++                              srk_handle,
+                               pubkey, pubkey_size,
+                               tpm2_pubkey_pcr_mask,
+                               /* pin= */ NULL,
+@@ -903,6 +905,7 @@ int decrypt_credential_and_warn(
+                 usec_t validate_timestamp,
+                 const char *tpm2_device,
+                 const char *tpm2_signature_path,
++                uint32_t srk_handle,
+                 const void *input,
+                 size_t input_size,
+                 void **ret,
+@@ -1043,6 +1046,7 @@ int decrypt_credential_and_warn(
+                  // through and used to verify the TPM session.
+                 r = tpm2_unseal(tpm2_device,
+                                 le64toh(t->pcr_mask),
++                                srk_handle,
+                                 le16toh(t->pcr_bank),
+                                 z ? z->data : NULL,
+                                 z ? le32toh(z->size) : 0,
+@@ -1213,11 +1217,11 @@ int get_credential_host_secret(CredentialSecretFlags flags, void **ret, size_t *
+         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Support for encrypted credentials not available.");
+ }
+ 
+-int encrypt_credential_and_warn(sd_id128_t with_key, const char *name, usec_t timestamp, usec_t not_after, const char *tpm2_device, uint32_t tpm2_hash_pcr_mask, const char *tpm2_pubkey_path, uint32_t tpm2_pubkey_pcr_mask, const void *input, size_t input_size, void **ret, size_t *ret_size) {
++int encrypt_credential_and_warn(sd_id128_t with_key, const char *name, usec_t timestamp, usec_t not_after, const char *tpm2_device, uint32_t tpm2_hash_pcr_mask, const char *tpm2_pubkey_path, uint32_t tpm2_pubkey_pcr_mask, uint32_t tpm2_srk_handle, const void *input, size_t input_size, void **ret, size_t *ret_size) {
+         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Support for encrypted credentials not available.");
+ }
+ 
+-int decrypt_credential_and_warn(const char *validate_name, usec_t validate_timestamp, const char *tpm2_device, const char *tpm2_signature_path, const void *input, size_t input_size, void **ret, size_t *ret_size) {
++int decrypt_credential_and_warn(const char *validate_name, usec_t validate_timestamp, const char *tpm2_device, const char *tpm2_signature_path, uint32_t tpm2_srk_handle, const void *input, size_t input_size, void **ret, size_t *ret_size) {
+         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Support for encrypted credentials not available.");
+ }
+ 
+diff --git a/src/shared/creds-util.h b/src/shared/creds-util.h
+index 05d8b74634..4f43801c10 100644
+--- a/src/shared/creds-util.h
++++ b/src/shared/creds-util.h
+@@ -71,5 +71,5 @@ int get_credential_user_password(const char *username, char **ret_password, bool
+ #define _CRED_AUTO                            SD_ID128_MAKE(a2,19,cb,07,85,b2,4c,04,b1,6d,18,ca,b9,d2,ee,01)
+ #define _CRED_AUTO_INITRD                     SD_ID128_MAKE(02,dc,8e,de,3a,02,43,ab,a9,ec,54,9c,05,e6,a0,71)
+ 
+-int encrypt_credential_and_warn(sd_id128_t with_key, const char *name, usec_t timestamp, usec_t not_after, const char *tpm2_device, uint32_t tpm2_hash_pcr_mask, const char *tpm2_pubkey_path, uint32_t tpm2_pubkey_pcr_mask, const void *input, size_t input_size, void **ret, size_t *ret_size);
+-int decrypt_credential_and_warn(const char *validate_name, usec_t validate_timestamp, const char *tpm2_device, const char *tpm2_signature_path, const void *input, size_t input_size, void **ret, size_t *ret_size);
++int encrypt_credential_and_warn(sd_id128_t with_key, const char *name, usec_t timestamp, usec_t not_after, const char *tpm2_device, uint32_t tpm2_hash_pcr_mask, const char *tpm2_pubkey_path, uint32_t tpm2_pubkey_pcr_mask, uint32_t tpm2_srk_handle, const void *input, size_t input_size, void **ret, size_t *ret_size);
++int decrypt_credential_and_warn(const char *validate_name, usec_t validate_timestamp, const char *tpm2_device, const char *tpm2_signature_path, uint32_t tpm2_srk_handle, const void *input, size_t input_size, void **ret, size_t *ret_size);
+diff --git a/src/shared/tpm2-util.c b/src/shared/tpm2-util.c
+index 73fd833cc6..d993fc8075 100644
+--- a/src/shared/tpm2-util.c
++++ b/src/shared/tpm2-util.c
+@@ -439,11 +439,11 @@ const TPM2B_PUBLIC *tpm2_get_primary_template(Tpm2SRKTemplateFlags flags) {
+  * Why and what is an SRK?
+  * TL;DR provides a working space for those without owner auth. The user enrolling
+  * the disk may not have access to the TPMs owner hierarchy auth, so they need a
+- * working space. This working space is at the defined address of 0x81000001.
++ * working space. This working space is at the defined address as supplied by
++ * the caller (default 0x81000001).
+  * Details can be found here:
+  *   - https://trustedcomputinggroup.org/wp-content/uploads/TCG-TPM-v2.0-Provisioning-Guidance-Published-v1r1.pdf
+  */
+-#define SRK_HANDLE UINT32_C(0x81000001)
+ 
+ /*
+  * Retrieves the SRK handle if present. Returns 0 if SRK not present, 1 if present
+@@ -452,6 +452,8 @@ const TPM2B_PUBLIC *tpm2_get_primary_template(Tpm2SRKTemplateFlags flags) {
+ static int tpm2_get_srk(
+                 Tpm2Context *c,
+                 TPMI_ALG_PUBLIC *ret_alg,
++                TPMA_OBJECT *ret_attributes,
++                uint32_t srk_handle,
+                 Tpm2Handle *ret_primary) {
+ 
+         TPMI_YES_NO more_data;
+@@ -466,7 +468,7 @@ static int tpm2_get_srk(
+                         ESYS_TR_NONE,
+                         ESYS_TR_NONE,
+                         TPM2_CAP_HANDLES,
+-                        SRK_HANDLE,
++                        srk_handle,
+                         1,
+                         &more_data,
+                         &cap_data);
+@@ -476,7 +478,7 @@ static int tpm2_get_srk(
+                                        sym_Tss2_RC_Decode(rc));
+ 
+         /* Did Not find SRK, indicate this by returning 0 */
+-        if (cap_data->data.handles.count == 0 || cap_data->data.handles.handle[0] != SRK_HANDLE) {
++        if (cap_data->data.handles.count == 0 || cap_data->data.handles.handle[0] != srk_handle) {
+                 ret_primary->esys_handle = ESYS_TR_NONE;
+ 
+                 if (ret_alg)
+@@ -500,6 +502,7 @@ static int tpm2_get_srk(
+                                         sym_Tss2_RC_Decode(rc));
+ 
+         /* Get the algorithm if the caller wants it */
++        ;
+         _cleanup_(Esys_Freep) TPM2B_PUBLIC *out_public = NULL;
+         if (ret_alg) {
+                 rc = sym_Esys_ReadPublic(
+@@ -521,7 +524,9 @@ static int tpm2_get_srk(
+ 
+         if (ret_alg)
+                  *ret_alg = out_public->publicArea.type;
+-
++        if (ret_attributes)
++                 *ret_attributes = out_public->publicArea.objectAttributes;
++        
+         return 1;
+ }
+ 
+@@ -529,7 +534,9 @@ static int tpm2_make_primary(
+                 Tpm2Context *c,
+                 TPMI_ALG_PUBLIC alg,
+                 bool use_srk_model,
++                uint32_t srk_handle,
+                 TPMI_ALG_PUBLIC *ret_alg,
++                TPMA_OBJECT *ret_attributes,
+                 Tpm2Handle **ret_primary) {
+ 
+         static const TPM2B_SENSITIVE_CREATE primary_sensitive = {};
+@@ -567,7 +574,7 @@ static int tpm2_make_primary(
+         /* Find existing SRK and use it if present */
+         if (use_srk_model) {
+                 TPMI_ALG_PUBLIC got_alg = TPM2_ALG_NULL;
+-                r = tpm2_get_srk(c, &got_alg, primary);
++                r = tpm2_get_srk(c, &got_alg, ret_attributes, srk_handle, primary);
+                 if (r < 0)
+                         return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
+                                                "Failed to establish if SRK is present");
+@@ -653,7 +660,7 @@ static int tpm2_make_primary(
+ 
+         if (use_srk_model) {
+                 rc = sym_Esys_EvictControl(c->esys_context, ESYS_TR_RH_OWNER, primary->esys_handle,
+-                                ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE, SRK_HANDLE, &primary->esys_handle);
++                                ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE, srk_handle, &primary->esys_handle);
+                 if (rc != TSS2_RC_SUCCESS)
+                         return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
+                                                "Failed to persist SRK within TPM: %s", sym_Tss2_RC_Decode(rc));
+@@ -1965,6 +1972,7 @@ static int tpm2_make_policy_session(
+ 
+ int tpm2_seal(const char *device,
+               uint32_t hash_pcr_mask,
++              uint32_t srk_handle,
+               const void *pubkey,
+               const size_t pubkey_size,
+               uint32_t pubkey_pcr_mask,
+@@ -1988,6 +1996,7 @@ int tpm2_seal(const char *device,
+         _cleanup_free_ void *hash = NULL;
+         TPM2B_SENSITIVE_CREATE hmac_sensitive;
+         TPMI_ALG_PUBLIC primary_alg;
++        TPMA_OBJECT attributes;
+         TPM2B_PUBLIC hmac_template;
+         usec_t start;
+         TSS2_RC rc;
+@@ -2033,7 +2042,7 @@ int tpm2_seal(const char *device,
+                 return r;
+ 
+         _cleanup_tpm2_handle_ Tpm2Handle *primary = NULL;
+-        r = tpm2_make_primary(c, /* alg = */0, !!ret_srk_buf, &primary_alg, &primary);
++        r = tpm2_make_primary(c, /* alg = */0, !!ret_srk_buf, srk_handle, &primary_alg, &attributes, &primary);
+         if (r < 0)
+                 return r;
+ 
+@@ -2070,7 +2079,7 @@ int tpm2_seal(const char *device,
+                 .publicArea = {
+                         .type = TPM2_ALG_KEYEDHASH,
+                         .nameAlg = TPM2_ALG_SHA256,
+-                        .objectAttributes = TPMA_OBJECT_FIXEDTPM | TPMA_OBJECT_FIXEDPARENT,
++                        .objectAttributes = attributes & (TPMA_OBJECT_FIXEDTPM | TPMA_OBJECT_FIXEDPARENT),
+                         .parameters.keyedHashDetail.scheme.scheme = TPM2_ALG_NULL,
+                         .unique.keyedHash.size = SHA256_DIGEST_SIZE,
+                         .authPolicy = *policy_digest,
+@@ -2187,6 +2196,7 @@ int tpm2_seal(const char *device,
+ 
+ int tpm2_unseal(const char *device,
+                 uint32_t hash_pcr_mask,
++                uint32_t srk_handle,
+                 uint16_t pcr_bank,
+                 const void *pubkey,
+                 size_t pubkey_size,
+@@ -2276,7 +2286,7 @@ int tpm2_unseal(const char *device,
+                                                "Failed to deserialize primary key: %s", sym_Tss2_RC_Decode(rc));
+         /* old callers without an SRK still need to create a key */
+         } else {
+-                r = tpm2_make_primary(c, primary_alg, false, NULL, &primary);
++                r = tpm2_make_primary(c, primary_alg, false, srk_handle, NULL, NULL, &primary);
+                 if (r < 0)
+                         return r;
+         }
+@@ -2714,11 +2724,13 @@ int tpm2_make_luks2_json(
+                 size_t salt_size,
+                 const void *srk_buf,
+                 size_t srk_buf_size,
++                uint32_t srk_handle,
+                 TPM2Flags flags,
+                 JsonVariant **ret) {
+ 
+         _cleanup_(json_variant_unrefp) JsonVariant *v = NULL, *hmj = NULL, *pkmj = NULL;
+         _cleanup_free_ char *keyslot_as_string = NULL;
++        _cleanup_free_ char *srk_handle_as_string = NULL;
+         int r;
+ 
+         assert(blob || blob_size == 0);
+@@ -2727,7 +2739,10 @@ int tpm2_make_luks2_json(
+ 
+         if (asprintf(&keyslot_as_string, "%i", keyslot) < 0)
+                 return -ENOMEM;
+-
++                
++        if (asprintf(&srk_handle_as_string, "0x%X", srk_handle) < 0)
++                return -ENOMEM;
++                
+         r = tpm2_make_pcr_json_array(hash_pcr_mask, &hmj);
+         if (r < 0)
+                 return r;
+@@ -2755,7 +2770,10 @@ int tpm2_make_luks2_json(
+                                        JSON_BUILD_PAIR_CONDITION(pubkey_pcr_mask != 0, "tpm2_pubkey_pcrs", JSON_BUILD_VARIANT(pkmj)),
+                                        JSON_BUILD_PAIR_CONDITION(pubkey_pcr_mask != 0, "tpm2_pubkey", JSON_BUILD_BASE64(pubkey, pubkey_size)),
+                                        JSON_BUILD_PAIR_CONDITION(salt, "tpm2_salt", JSON_BUILD_BASE64(salt, salt_size)),
+-                                       JSON_BUILD_PAIR_CONDITION(srk_buf, "tpm2_srk", JSON_BUILD_BASE64(srk_buf, srk_buf_size))));
++                                       JSON_BUILD_PAIR_CONDITION(srk_buf, "tpm2_srk", JSON_BUILD_BASE64(srk_buf, srk_buf_size)),
++                                       JSON_BUILD_PAIR("tpm2_srk_handle", JSON_BUILD_STRING(srk_handle_as_string))
++                        )
++        );
+         if (r < 0)
+                 return r;
+ 
+@@ -2782,11 +2800,12 @@ int tpm2_parse_luks2_json(
+                 size_t *ret_salt_size,
+                 void **ret_srk_buf,
+                 size_t *ret_srk_buf_size,
++                uint32_t *ret_srk_handle,
+                 TPM2Flags *ret_flags) {
+ 
+         _cleanup_free_ void *blob = NULL, *policy_hash = NULL, *pubkey = NULL, *salt = NULL, *srk_buf = NULL;
+         size_t blob_size = 0, policy_hash_size = 0, pubkey_size = 0, salt_size = 0, srk_buf_size = 0;
+-        uint32_t hash_pcr_mask = 0, pubkey_pcr_mask = 0;
++        uint32_t hash_pcr_mask = 0, pubkey_pcr_mask = 0, srk_handle = TPM2_SRK_HANDLE_DEFAULT;
+         uint16_t primary_alg = TPM2_ALG_ECC; /* ECC was the only supported algorithm in systemd < 250, use that as implied default, for compatibility */
+         uint16_t pcr_bank = UINT16_MAX; /* default: pick automatically */
+         int r, keyslot = -1;
+@@ -2794,7 +2813,7 @@ int tpm2_parse_luks2_json(
+         JsonVariant *w;
+ 
+         assert(v);
+-
++        
+         if (ret_keyslot) {
+                 keyslot = cryptsetup_get_keyslot_from_token(v);
+                 if (keyslot < 0) {
+@@ -2892,13 +2911,23 @@ int tpm2_parse_luks2_json(
+         } else if (pubkey_pcr_mask != 0)
+                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Public key PCR mask set, but not public key included in JSON data, refusing.");
+ 
++
+         w = json_variant_by_key(v, "tpm2_srk");
+         if (w) {
+                 r = json_variant_unbase64(w, &srk_buf, &srk_buf_size);
+                 if (r < 0)
+                         return log_debug_errno(r, "Invalid base64 data in 'tpm2_srk' field.");
+         }
+-
++       
++        w = json_variant_by_key(v, "tpm2_srk_handle");
++        if (w) {
++                r = safe_atou_full(json_variant_string(w), 16, &srk_handle);
++                if (r < 0) {
++                        srk_handle = TPM2_SRK_HANDLE_DEFAULT;
++                        log_debug_errno(r, "Invalid handle data in 'tpm2_srk_handle' field."); 
++                }
++        }
++        
+         if (ret_keyslot)
+                 *ret_keyslot = keyslot;
+         if (ret_hash_pcr_mask)
+@@ -2931,6 +2960,8 @@ int tpm2_parse_luks2_json(
+                 *ret_srk_buf = TAKE_PTR(srk_buf);
+         if (ret_srk_buf_size)
+                 *ret_srk_buf_size = srk_buf_size;
++        if (ret_srk_handle)
++                *ret_srk_handle = srk_handle;
+ 
+         return 0;
+ }
+diff --git a/src/shared/tpm2-util.h b/src/shared/tpm2-util.h
+index 6634e2d242..e3f55f0c9a 100644
+--- a/src/shared/tpm2-util.h
++++ b/src/shared/tpm2-util.h
+@@ -71,8 +71,8 @@ extern TSS2_RC (*sym_Tss2_MU_TPM2B_PUBLIC_Unmarshal)(uint8_t const buffer[], siz
+ 
+ int dlopen_tpm2(void);
+ 
+-int tpm2_seal(const char *device, uint32_t hash_pcr_mask, const void *pubkey, size_t pubkey_size, uint32_t pubkey_pcr_mask, const char *pin, void **ret_secret, size_t *ret_secret_size, void **ret_blob, size_t *ret_blob_size, void **ret_pcr_hash, size_t *ret_pcr_hash_size, uint16_t *ret_pcr_bank, uint16_t *ret_primary_alg, void **ret_srk_buf, size_t *ret_srk_buf_size);
+-int tpm2_unseal(const char *device, uint32_t hash_pcr_mask, uint16_t pcr_bank, const void *pubkey, size_t pubkey_size, uint32_t pubkey_pcr_mask, JsonVariant *signature, const char *pin, uint16_t primary_alg, const void *blob, size_t blob_size, const void *policy_hash, size_t policy_hash_size, const void *srk_buf, size_t srk_buf_size, void **ret_secret, size_t *ret_secret_size);
++int tpm2_seal(const char *device, uint32_t hash_pcr_mask, uint32_t srk_handle, const void *pubkey, size_t pubkey_size, uint32_t pubkey_pcr_mask, const char *pin, void **ret_secret, size_t *ret_secret_size, void **ret_blob, size_t *ret_blob_size, void **ret_pcr_hash, size_t *ret_pcr_hash_size, uint16_t *ret_pcr_bank, uint16_t *ret_primary_alg, void **ret_srk_buf, size_t *ret_srk_buf_size);
++int tpm2_unseal(const char *device, uint32_t hash_pcr_mask, uint32_t srk_handle, uint16_t pcr_bank, const void *pubkey, size_t pubkey_size, uint32_t pubkey_pcr_mask, JsonVariant *signature, const char *pin, uint16_t primary_alg, const void *blob, size_t blob_size, const void *policy_hash, size_t policy_hash_size, const void *srk_buf, size_t srk_buf_size, void **ret_secret, size_t *ret_secret_size);
+ 
+ typedef struct {
+         unsigned n_ref;
+@@ -144,12 +144,14 @@ int tpm2_find_device_auto(int log_level, char **ret);
+ int tpm2_make_pcr_json_array(uint32_t pcr_mask, JsonVariant **ret);
+ int tpm2_parse_pcr_json_array(JsonVariant *v, uint32_t *ret);
+ 
+-int tpm2_make_luks2_json(int keyslot, uint32_t hash_pcr_mask, uint16_t pcr_bank, const void *pubkey, size_t pubkey_size, uint32_t pubkey_pcr_mask, uint16_t primary_alg, const void *blob, size_t blob_size, const void *policy_hash, size_t policy_hash_size, const void *salt, size_t salt_size, const void *srk_buf, size_t srk_buf_size, TPM2Flags flags, JsonVariant **ret);
+-int tpm2_parse_luks2_json(JsonVariant *v, int *ret_keyslot, uint32_t *ret_hash_pcr_mask, uint16_t *ret_pcr_bank, void **ret_pubkey, size_t *ret_pubkey_size, uint32_t *ret_pubkey_pcr_mask, uint16_t *ret_primary_alg, void **ret_blob, size_t *ret_blob_size, void **ret_policy_hash, size_t *ret_policy_hash_size, void **ret_salt, size_t *ret_salt_size, void **ret_srk_buf, size_t *ret_srk_buf_size, TPM2Flags *ret_flags);
++int tpm2_make_luks2_json(int keyslot, uint32_t hash_pcr_mask, uint16_t pcr_bank, const void *pubkey, size_t pubkey_size, uint32_t pubkey_pcr_mask, uint16_t primary_alg, const void *blob, size_t blob_size, const void *policy_hash, size_t policy_hash_size, const void *salt, size_t salt_size, const void *srk_buf, size_t srk_buf_size, uint32_t srk_handle, TPM2Flags flags, JsonVariant **ret);
++int tpm2_parse_luks2_json(JsonVariant *v, int *ret_keyslot, uint32_t *ret_hash_pcr_mask, uint16_t *ret_pcr_bank, void **ret_pubkey, size_t *ret_pubkey_size, uint32_t *ret_pubkey_pcr_mask, uint16_t *ret_primary_alg, void **ret_blob, size_t *ret_blob_size, void **ret_policy_hash, size_t *ret_policy_hash_size, void **ret_salt, size_t *ret_salt_size, void **ret_srk_buf, size_t *ret_srk_buf_size, uint32_t *srk_handle, TPM2Flags *ret_flags);
+ 
+ /* Default to PCR 7 only */
+ #define TPM2_PCR_MASK_DEFAULT (UINT32_C(1) << 7)
+ 
++#define TPM2_SRK_HANDLE_DEFAULT 0x81000001
++
+ /* We want the helpers below to work also if TPM2 libs are not available, hence define these four defines if
+  * they are missing. */
+ #ifndef TPM2_ALG_SHA1
