@@ -11,9 +11,9 @@
 # prior to decryption of the root partition. 
 BASEDIR=/boot/tpm_keys
 
-mkdir $BASEDIR/my_keys
-mkdir $BASEDIR/clients
-mkdir $BASEDIR/servers
+mkdir -p $BASEDIR/my_keys
+mkdir -p $BASEDIR/clients
+mkdir -p $BASEDIR/servers
 cd $BASEDIR/my_keys
 
 # Get existing TPM owner password, or set new one
@@ -38,8 +38,8 @@ tpm2_evictcontrol -C o -c primary.ctx 0x81000003 -P "$OPW"
 # Use a policy that allows duplication
 tpm2_startauthsession -S session.dat
 tpm2_policycommandcode -S session.dat -L dpolicy.dat TPM2_CC_Duplicate
+tpm2_policysecret -S session.dat -c o -L dpolicy.dat "$OPW"
 tpm2_flushcontext session.dat
-rm session.dat
 tpm2_create -C 0x81000003 -r my_drsk.prv -u my_drsk.pub -L dpolicy.dat -a \
 	"sensitivedataorigin|userwithauth|restricted|decrypt"
 
@@ -50,4 +50,6 @@ tpm2_evictcontrol -C o -c my_drsk.ctx 0x81000004 -P "$OPW"
 # hash the public key to form MYID for this host
 openssl dgst -sha256 my_drsk.pub | awk '{print $2}' > myid
 
+# clean up
+rm session.dat dpolicy.dat my_drsk.ctx primary.ctx
 

@@ -1,6 +1,6 @@
 #!/bin/sh
 # migrate a key duplicated for this TPM's DRSK (0x81000004) key.
-# Basically we just make sure it loads.
+# Basically we just make sure it can be duplicated and that it loads.
 # Most of the real work is done in recovery.sh, which migrates
 # this key back to the client.
 
@@ -18,15 +18,25 @@ if [ -z "$1" ]
         echo "Client ID required"
         exit 1
 fi
+# we are called with $2 set to this server's owner password
+if [ -z "$2" ]
+    then
+        echo "Server Owner Password required"
+        exit 1
+fi
 cd $BASEDIR/clients/$1
 
 echo "Creating duplicate policy"
 tpm2_startauthsession -S session.dat
 tpm2_policycommandcode -S session.dat -L dpolicy.dat TPM2_CC_Duplicate
+tpm2_policysecret -S session.dat -c o -L dpolicy.dat $2
 tpm2_flushcontext session.dat
 # import the duplicate key under the server key, and test that it loads
 echo "migrating the duplicated key to this TPM"
 tpm2_import -C 0x81000004 -u dup.pub -i dup.dpriv -r dup.prv -s dup.seed -L dpolicy.dat
 tpm2_flushcontext --transient-object
 tpm2_load -C 0x81000004 -u dup.pub -r dup.prv -c dup.ctx
+
+# clean up
+rm -f session.dat dpolicy.dat dup.ctx
 
