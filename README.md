@@ -39,7 +39,7 @@ to backup and restore the local TPM. A typical usage would be:
     tpm2go_restore.sh       # restore the local TPM's DRSK from the tpm2go
     
 The tpm2go support in tpm2-tss is upstream in the master, but (as of Fedora 39)
-has not made it downstream. To add this support, built the upstream version with:
+has not made it downstream. To add this support, builf the upstream version with:
 
     sudo dnf install libtool automake autoconf autoconf-archive libusb1-devel
     sudo dnf builddep tpm2-tss
@@ -50,4 +50,5 @@ has not made it downstream. To add this support, built the upstream version with
     make
     sudo make install
 
-
+Note that the tpm2-tss support for tpm2go seems to throw occasional timeout errors, 
+but everything still works. I'm working that separately with the tpm2-tss team.
