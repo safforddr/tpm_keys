@@ -29,9 +29,13 @@ an Infineon discrete TPM built in, making it ideal for backup/restore.)
 
 There are separate scripts for provisioning a tpm2go, and for using it 
 to backup and restore the local TPM. A typical usage would be:
+
     provision.sh            # provision the local TPM
+    
     tpm2go_provision.sh     # provision the tpm2go device
+
     tpm2go_backup.sh        # backup the local TPM's DRSK to the tpm2go
+    
     tpm2go_restore.sh       # restore the local TPM's DRSK from the tpm2go
     
 The tpm2go support in tpm2-tss is upstream in the master, but (as of Fedora 39)
