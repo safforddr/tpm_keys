@@ -27,8 +27,13 @@ else
 fi
 
 # clean up any leftover keys
-tpm2_evictcontrol -C o -c 0x81000003 -P "$OPW"
-tpm2_evictcontrol -C o -c 0x81000004 -P "$OPW"
+echo "Cleaning up old keys"
+if tpm2_getcap handles-persistent | grep -q 0x81000003 ; then
+	tpm2_evictcontrol -C o -c 0x81000003 -P "$OPW" 
+fi
+if tpm2_getcap handles-persistent | grep -q 0x81000004 ; then
+	tpm2_evictcontrol -C o -c 0x81000004 -P "$OPW" 
+fi
 
 # create SRK at 0x81000003
 echo "SRK" | tpm2_createprimary -c primary.ctx -P "$OPW" -u -
