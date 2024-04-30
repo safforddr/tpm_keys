@@ -21,7 +21,9 @@ NOTE: provision.sh will set an owner password, which causes problems
 with systemd-cryptenroll. Apply the supplied srk_handle.patch to
 the upstream systemd to add a --tpm2-srk-handle= argument. Then
 after provisioning, you can set --tpm2-srk-handle=0x81000004 to
-use the recoverable DRSK as storage root.
+use the recoverable DRSK as storage root. NEW: as of systemd 255
+(e.g. Fedora 40), systemd-cryptenroll has a --tpm2-seal-key-handle=
+argument which replaces this srk-handle.patch.
 
 NEW: This package now supports backups to a local tpm2go device,
 as well as remote systems with TPMs. (A tpm2go is a USB token with
