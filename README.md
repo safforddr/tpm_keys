@@ -19,7 +19,7 @@ cd /boot/tpm_keys/bin
 
 NOTE: systemd-cryptenroll has a --tpm2-seal-key-handle=
 argument which allows the use of a persistent SRK, as
-described in this package. As of January 19, 2025, it also
+described in this package. As of January 19, 2026, it also
 supports sealing under a DRSK as described here.
 It may take a while for this version of systemd to propagate
 to distros, so if sealing under a DRSK does not work, you may need to 
